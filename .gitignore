@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.cursor/
+.env
+.ipynb_checkpoints/
+
+data/
+results/
+
+*.zip
+*.pt
+*.pth
+*.ckpt
