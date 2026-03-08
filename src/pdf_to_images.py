@@ -9,6 +9,8 @@ from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError
 
 from .dataset_io import ensure_dir, stable_page_id
 
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb check
 
 @dataclasses.dataclass(frozen=True)
 class PdfPageImage:
@@ -76,6 +78,8 @@ def convert_pdf_to_images(
                 first_page=page_number,
                 last_page=page_number,
                 poppler_path=poppler_path,
+                use_pdftocairo=True,
+                thread_count=1,
             )
         except PDFInfoNotInstalledError as e:
             raise RuntimeError(
@@ -103,4 +107,3 @@ def convert_pdf_to_images(
         )
 
     return results
-

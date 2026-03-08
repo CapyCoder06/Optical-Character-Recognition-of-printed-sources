@@ -1,13 +1,27 @@
-__pycache__/
-*.pyc
-.cursor/
-.env
-.ipynb_checkpoints/
-
-data/
+# Results and artifacts (too large)
 results/
 
-*.zip
-*.pt
-*.pth
-*.ckpt
+# Data (PDFs and images, too large)
+data/Print/
+data/ground_truth/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

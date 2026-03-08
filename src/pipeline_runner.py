@@ -13,7 +13,7 @@ from . import dataset_io
 from .dataset_io import PageEntry, SourceRef
 from .evaluation import NormalizationConfig, evaluate_predictions
 from .llm_correction import LLMConfig, correct_text, make_diff
-from .ocr_model import OCRConfig, TrOCREngine, crop_to_pil
+from .ocr_model import OCRConfig, build_ocr_engine, GeminiPageOCREngine, OpenAIPageOCREngine, GroqPageOCREngine, crop_to_pil
 from .pdf_to_images import convert_pdf_to_images
 from .preprocessing import PreprocessConfig, preprocess_image
 from .text_detection import TextDetectionConfig, detect, draw_overlay, regions_to_dict
@@ -53,8 +53,16 @@ def _load_ground_truth(cfg: Dict[str, Any], base_dir: Path) -> Optional[Dict[str
     if p.suffix.lower() in {".json"}:
         with p.open("r", encoding="utf-8") as f:
             d = json.load(f)
+        # Format 1: {"document": "page_id", "lines": ["line1", ...]}
+        if isinstance(d, dict) and "document" in d and "lines" in d:
+            page_id = str(d["document"])
+            lines = d.get("lines") or []
+            text = "\n".join(str(line) for line in lines)
+            return {page_id: text}
+        # Format 2: simple mapping {"page_id": "full text", ...}
         if not isinstance(d, dict):
-            raise ValueError("ground_truth JSON must be a mapping of page_id -> text")
+            raise ValueError("ground_truth JSON must be a mapping of page_id -> text, "
+                             "or an object with 'document' and 'lines'.")
         return {str(k): str(v) for k, v in d.items()}
     raise ValueError("Unsupported ground_truth format. Use a JSON mapping page_id -> text.")
 
@@ -232,7 +240,26 @@ def run_pipeline(
         dataset_io.ensure_dir(items_dir)
         dataset_io.ensure_dir(pages_dir)
 
-        engine = TrOCREngine(ocr_cfg)
+        engine = build_ocr_engine(ocr_cfg)
+
+        # Helper: tight-crop a line from the grayscale image
+        def _tight_crop_pil(gray_img: np.ndarray, bbox: tuple):
+            from PIL import Image as _Image
+            x, y, w, h = bbox
+            ih, iw = gray_img.shape[:2]
+            x, y = max(0, x), max(0, y)
+            w, h = min(w, iw - x), min(h, ih - y)
+            if h < 20 or w < 10:
+                return None
+            crop = gray_img[y: y + h, x: x + w]
+            if crop.size == 0:
+                return None
+            col_has_ink = (crop < 128).any(axis=0)
+            ink_cols = np.where(col_has_ink)[0]
+            if len(ink_cols) < 5:
+                return None
+            tight = crop[:, max(0, int(ink_cols[0]) - 4): min(w, int(ink_cols[-1]) + 5)]
+            return _Image.fromarray(tight).convert("RGB") if tight.shape[1] >= 10 else None
 
         for page in pages_sorted:
             pre_rel = page.artifacts.get("preprocess", {}).get("image")
@@ -253,6 +280,61 @@ def run_pipeline(
             if img is None:
                 raise RuntimeError(f"Failed to read image: {pre_path}")
 
+            # ----------------------------------------------------------------
+            # Page-level VLM OCR (OpenAI or Gemini): 1 API call per page
+            # ----------------------------------------------------------------
+            if isinstance(engine, (GeminiPageOCREngine, OpenAIPageOCREngine, GroqPageOCREngine)):
+                from PIL import Image as _PILImage
+                raw_rel = page.artifacts.get("pdf_to_images", {}).get("raw_image")
+                if raw_rel and (run_dir / raw_rel).exists():
+                    raw_img = cv2.imread(str(run_dir / raw_rel))
+                    page_pil = _PILImage.fromarray(cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB))
+                else:
+                    page_pil = _PILImage.fromarray(img).convert("RGB")
+
+                backend_name = "Groq" if isinstance(engine, GroqPageOCREngine) else ("OpenAI" if isinstance(engine, OpenAIPageOCREngine) else "Gemini")
+                print(f"  [{backend_name}] Sending full page {page.page_id}...")
+                page_lines_text = engine.recognize_page(page_pil)
+
+                det_data = _load_detection_json(det_path)
+                regions = det_data.get("regions", [])
+                ocr_items: List[Dict[str, Any]] = []
+                for r in regions:
+                    rb = r["bbox"]
+                    if r.get("lines"):
+                        for ln in r["lines"]:
+                            b = ln["bbox"]
+                            ocr_items.append({
+                                "type": "line",
+                                "region_order": int(r["order"]),
+                                "line_order": int(ln["order"]),
+                                "bbox": (int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])),
+                                "text": "", "confidence": None,
+                            })
+                    else:
+                        ocr_items.append({
+                            "type": "region",
+                            "region_order": int(r["order"]),
+                            "bbox": (int(rb["x"]), int(rb["y"]), int(rb["w"]), int(rb["h"])),
+                            "text": "", "confidence": None,
+                        })
+
+                for item, line_text in zip(ocr_items, page_lines_text):
+                    item["text"] = line_text
+                for extra in page_lines_text[len(ocr_items):]:
+                    if extra.strip():
+                        ocr_items.append({"type": "vlm_extra", "text": extra, "confidence": None})
+
+                page_text = "\n".join(i["text"] for i in ocr_items if i.get("text", "").strip())
+                dataset_io.write_json(item_json_path, {"page_id": page.page_id, "items": ocr_items})
+                page_text_path.write_text(page_text.strip() + "\n", encoding="utf-8")
+                dataset_io.register_artifact(manifest, page.page_id, "ocr", "items_json", _rel(run_dir, item_json_path))
+                dataset_io.register_artifact(manifest, page.page_id, "ocr", "page_text", _rel(run_dir, page_text_path))
+                continue
+
+            # ----------------------------------------------------------------
+            # TrOCR line-level OCR
+            # ----------------------------------------------------------------
             det_data = _load_detection_json(det_path)
             regions = det_data.get("regions", [])
             ocr_items: List[Dict[str, Any]] = []
@@ -264,31 +346,24 @@ def run_pipeline(
                     for ln in r["lines"]:
                         b = ln["bbox"]
                         bbox = (int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"]))
-                        pil_crops.append(crop_to_pil(img, bbox))
-                        ocr_items.append(
-                            {
-                                "type": "line",
-                                "region_order": int(r["order"]),
-                                "line_order": int(ln["order"]),
-                                "bbox": bbox,
-                            }
-                        )
+                        pil = _tight_crop_pil(img, bbox)
+                        if pil is None:
+                            continue
+                        pil_crops.append(pil)
+                        ocr_items.append({"type": "line", "region_order": int(r["order"]),
+                                          "line_order": int(ln["order"]), "bbox": bbox})
                 else:
                     bbox = (int(rb["x"]), int(rb["y"]), int(rb["w"]), int(rb["h"]))
-                    pil_crops.append(crop_to_pil(img, bbox))
-                    ocr_items.append(
-                        {
-                            "type": "region",
-                            "region_order": int(r["order"]),
-                            "bbox": bbox,
-                        }
-                    )
+                    pil = _tight_crop_pil(img, bbox)
+                    if pil is None:
+                        continue
+                    pil_crops.append(pil)
+                    ocr_items.append({"type": "region", "region_order": int(r["order"]), "bbox": bbox})
 
             results = engine.recognize(pil_crops) if pil_crops else []
             if len(results) != len(ocr_items):
                 raise RuntimeError("OCR result count mismatch with crop count.")
 
-            # Attach outputs and reconstruct page text in reading order
             page_lines: List[str] = []
             for item, res in zip(ocr_items, results):
                 item["text"] = res.text
@@ -297,7 +372,6 @@ def run_pipeline(
 
             dataset_io.write_json(item_json_path, {"page_id": page.page_id, "items": ocr_items})
             page_text_path.write_text("\n".join(page_lines).strip() + "\n", encoding="utf-8")
-
             dataset_io.register_artifact(manifest, page.page_id, "ocr", "items_json", _rel(run_dir, item_json_path))
             dataset_io.register_artifact(manifest, page.page_id, "ocr", "page_text", _rel(run_dir, page_text_path))
 
@@ -405,4 +479,3 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
